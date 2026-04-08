@@ -1,0 +1,210 @@
+version: "3.8"
+
+name: delta-lakehouse
+
+# ---------------------------------------------------------------------------
+# Image: docker.io/library/spark:4.0.1-python3  (official Docker image)
+#   Spark 4.0.1 · Scala 2.13 · Java 21 · Python 3
+#
+# Delta Lake 4.0.0 — compatible with Spark 4.0.x
+#   artifact: io.delta:delta-spark_4.0_2.13:4.0.0
+#
+# Hadoop AWS 3.4.1 — required for Delta 4.x (3.3.x causes conflicts)
+#   artifact: org.apache.hadoop:hadoop-aws:3.4.1
+# ---------------------------------------------------------------------------
+
+# The official Spark image runs as the 'spark' user and expects:
+#   SPARK_HOME=/opt/spark
+#   master/worker started via $SPARK_HOME/sbin/start-*.sh  OR
+#   direct entrypoint: /opt/entrypoint.sh <class>
+#
+# For standalone cluster we use the sbin scripts and keep containers alive
+# with a tail on the log.
+
+x-spark-env: &spark-env
+  SPARK_HOME: /opt/spark
+  SPARK_MASTER_HOST: spark-master
+  SPARK_MASTER_PORT: "7077"
+  SPARK_MASTER_WEBUI_PORT: "8080"
+  # S3A → MinIO
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_DEFAULT_REGION: us-east-1
+
+x-spark-defaults: &spark-defaults
+  # Written to spark-defaults.conf so every process picks them up
+  SPARK_CONF_spark_hadoop_fs_s3a_endpoint: http://minio:9000
+  SPARK_CONF_spark_hadoop_fs_s3a_path_style_access: "true"
+  SPARK_CONF_spark_hadoop_fs_s3a_impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+  SPARK_CONF_spark_hadoop_fs_s3a_aws_credentials_provider: org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+  SPARK_CONF_spark_sql_extensions: io.delta.sql.DeltaSparkSessionExtension
+  SPARK_CONF_spark_sql_catalog_spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
+  # Ivy cache shared across containers via volume
+  SPARK_CONF_spark_jars_ivy: /opt/spark/.ivy2
+
+services:
+
+  # ── MinIO ─────────────────────────────────────────────────────────────────
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console  →  http://localhost:9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # ── MinIO init ────────────────────────────────────────────────────────────
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/lakehouse &&
+        mc mb --ignore-existing local/lakehouse/bronze &&
+        mc mb --ignore-existing local/lakehouse/silver &&
+        mc mb --ignore-existing local/lakehouse/gold &&
+        mc mb --ignore-existing local/lakehouse/spark-logs &&
+        echo 'Buckets ready.'
+      "
+    networks:
+      - lakehouse
+
+  # ── Spark Master ──────────────────────────────────────────────────────────
+  spark-master:
+    image: spark:4.0.1-python3
+    container_name: spark-master
+    environment:
+      <<: [*spark-env, *spark-defaults]
+      SPARK_MODE: master
+    command: >
+      bash -c "
+        /opt/spark/sbin/start-master.sh &&
+        tail -f /opt/spark/logs/*
+      "
+    ports:
+      - "8080:8080"   # Spark UI  →  http://localhost:8080
+      - "7077:7077"   # Cluster port
+    volumes:
+      - ivy-cache:/opt/spark/.ivy2
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - lakehouse
+
+  # ── Spark Worker ──────────────────────────────────────────────────────────
+  spark-worker:
+    image: spark:4.0.1-python3
+    container_name: spark-worker-1
+    environment:
+      <<: [*spark-env, *spark-defaults]
+      SPARK_MODE: worker
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: "2"
+    command: >
+      bash -c "
+        /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+        tail -f /opt/spark/logs/*
+      "
+    volumes:
+      - ivy-cache:/opt/spark/.ivy2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ── Spark History Server ──────────────────────────────────────────────────
+  spark-history:
+    image: spark:4.0.1-python3
+    container_name: spark-history
+    environment:
+      <<: *spark-env
+      SPARK_HISTORY_OPTS: >-
+        -Dspark.history.fs.logDirectory=s3a://lakehouse/spark-logs
+        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
+        -Dspark.hadoop.fs.s3a.access.key=minioadmin
+        -Dspark.hadoop.fs.s3a.secret.key=minioadmin
+        -Dspark.hadoop.fs.s3a.path.style.access=true
+        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    command: >
+      bash -c "
+        /opt/spark/sbin/start-history-server.sh &&
+        tail -f /opt/spark/logs/*
+      "
+    ports:
+      - "18080:18080"  # History UI  →  http://localhost:18080
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ── JupyterLab ────────────────────────────────────────────────────────────
+  # Built from Dockerfile.jupyter: spark:4.0.1-python3 base + JupyterLab +
+  # delta-spark + hadoop-aws jars pre-fetched at image build time.
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    container_name: jupyter
+    ports:
+      - "8888:8888"   # JupyterLab  →  http://localhost:8888  (token: lakehouse)
+    environment:
+      JUPYTER_TOKEN: lakehouse
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+      PYSPARK_SUBMIT_ARGS: >-
+        --master spark://spark-master:7077
+        --packages io.delta:delta-spark_2.13:4.0.0,org.apache.hadoop:hadoop-aws:3.4.1
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+        --conf spark.hadoop.fs.s3a.access.key=minioadmin
+        --conf spark.hadoop.fs.s3a.secret.key=minioadmin
+        --conf spark.hadoop.fs.s3a.path.style.access=true
+        --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+        --conf spark.eventLog.enabled=true
+        --conf spark.eventLog.dir=s3a://lakehouse/spark-logs
+        pyspark-shell
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ivy-cache:/opt/spark/.ivy2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - lakehouse
+
+volumes:
+  minio-data:
+  ivy-cache:      # shared Ivy/Maven cache so jars are only downloaded once
+
+networks:
+  lakehouse:
+    driver: bridge
