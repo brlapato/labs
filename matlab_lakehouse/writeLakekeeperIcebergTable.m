@@ -15,6 +15,18 @@ function writeLakekeeperIcebergTable(T, namespace, tableName, options)
 %       ClientSecret   - OAuth2 client secret
 %       Scope          - OAuth2 scope (default "lakekeeper")
 %       Mode           - 'append' (default), 'overwrite', or 'create'
+%       S3Endpoint     - S3-compatible endpoint URL, e.g.
+%                        "http://localhost:9000" for a local MinIO
+%                        instance (leave empty to use AWS default)
+%       S3AccessKeyId  - access key for the S3-compatible store
+%       S3SecretAccessKey - secret key for the S3-compatible store
+%       S3Region       - region string; some local S3 stores require
+%                        any non-empty value even if unused
+%                        (default "us-east-1")
+%       S3PathStyleAccess - true (default) to address buckets as
+%                        endpoint/bucket/key instead of
+%                        bucket.endpoint/key. Required by most local
+%                        S3-compatible stores (e.g. MinIO).
 %
 %   EXAMPLE
 %       T = table((1:5)', {'a';'b';'c';'d';'e'}, 'VariableNames', {'id','label'});
@@ -50,6 +62,11 @@ arguments
     options.ClientSecret (1,:) char = ""
     options.Scope (1,:) char = "lakekeeper"
     options.Mode (1,:) char {mustBeMember(options.Mode, {'append','overwrite','create'})} = "append"
+    options.S3Endpoint (1,:) char = ""
+    options.S3AccessKeyId (1,:) char = ""
+    options.S3SecretAccessKey (1,:) char = ""
+    options.S3Region (1,:) char = "us-east-1"
+    options.S3PathStyleAccess (1,1) logical = true
 end
 
     % --- 1. Verify Python environment & pyiceberg availability ---
@@ -77,19 +94,32 @@ end
     pyicb = py.importlib.import_module('pyiceberg.catalog');
     pq = py.importlib.import_module('pyarrow.parquet');
 
+    catalogArgs = {'type', 'rest', 'uri', options.CatalogUri, 'warehouse', options.Warehouse};
+
     if strlength(options.ClientId) > 0
-        catalog = pyicb.load_catalog('lakekeeper', pyargs( ...
-            'type', 'rest', ...
-            'uri', options.CatalogUri, ...
-            'warehouse', options.Warehouse, ...
-            'credential', sprintf('%s:%s', options.ClientId, options.ClientSecret), ...
-            'scope', options.Scope));
-    else
-        catalog = pyicb.load_catalog('lakekeeper', pyargs( ...
-            'type', 'rest', ...
-            'uri', options.CatalogUri, ...
-            'warehouse', options.Warehouse));
+        catalogArgs = [catalogArgs, {'credential', sprintf('%s:%s', options.ClientId, options.ClientSecret), ...
+            'scope', options.Scope}];
     end
+
+    % S3-compatible storage (e.g. local MinIO) config, forwarded by
+    % pyiceberg to its PyArrowFileIO / S3FileSystem.
+    if strlength(options.S3Endpoint) > 0
+        catalogArgs = [catalogArgs, {'s3.endpoint', options.S3Endpoint}];
+    end
+    if strlength(options.S3AccessKeyId) > 0
+        catalogArgs = [catalogArgs, {'s3.access-key-id', options.S3AccessKeyId, ...
+            's3.secret-access-key', options.S3SecretAccessKey}];
+    end
+    if strlength(options.S3Region) > 0
+        catalogArgs = [catalogArgs, {'s3.region', options.S3Region}];
+    end
+    if options.S3PathStyleAccess
+        catalogArgs = [catalogArgs, {'s3.path-style-access', 'true'}];
+    else
+        catalogArgs = [catalogArgs, {'s3.path-style-access', 'false'}];
+    end
+
+    catalog = pyicb.load_catalog('lakekeeper', pyargs(catalogArgs{:}));
 
     % --- 4. Read the Parquet file back as a pyarrow Table (gives schema) ---
     arrowTable = pq.read_table(parquetFile);
